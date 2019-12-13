@@ -1,0 +1,542 @@
+---
+title: "Robust SSA methods"
+author: "A. Tretyakova"
+date: '5 декабря 2019 г '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(Rssa)
+library(pcaL1)
+library(pcaMethods)
+library(matrixcalc)
+#library(VGAM)
+#library(pracma)
+#library(Matrix)
+
+hankL1<- function(A) {
+  N<-nrow(A)+ncol(A)-1
+  F<-rep(0,N)
+  L.1<-min(nrow(A),ncol(A))
+  K.1<-max(nrow(A),ncol(A))
+  for(k in 1:N) {
+    v<-A[c(row(A) + col(A) - k == 1)]
+    F[k]<-median(v)
+  }
+  return (F)
+}
+
+hankL2<- function(A) {
+  N<-nrow(A)+ncol(A)-1
+  F<-rep(0,N)
+  L.1<-min(nrow(A),ncol(A))
+  K.1<-max(nrow(A),ncol(A))
+  for(k in 1:N) {
+    v<-A[c(row(A) + col(A) - k == 1)]
+    F[k]<-mean(v)
+  }
+  return (F)
+}
+
+weights<-function(R,sigma,a,m,n){
+  x<-R/sigma
+  W<-matrix(0L, nrow = m, ncol = n)
+  W[which(abs(x)<=a,arr.ind=TRUE)]<-(1-(abs(x[which(abs(x)<=a,arr.ind=TRUE)])/a)^2)^2
+  return(W)
+}
+
+calc.ends<-function(vec,L){
+  N<-length(vec)
+  res<-rep(NaN, (L+1))
+  for (i in (1:(L+1))) {
+    slide<-vec[(N-2*L+i):N]
+    res[i]<-median(slide)
+  }
+  return(res)
+}
+```
+
+Пусть имеется ряд $$x_n= n e^{an} \sin(2\pi\omega n) + Ae^{an}\varepsilon_n,$$ где $\varepsilon_i\sim N(0,1)$. 
+Возьмем уже имеющийся сигнал из примера, добавим к нему шум, получим ряд длины $N=240$: $$x_n=n e^{4n/N} \sin(2\pi n/30) + Ae^{4n/N}\varepsilon_n,$$ где $\varepsilon_i\sim N(0,1)$. 
+
+Будем добавлять 5% выбросов размера $1.5x_i$.
+
+Для того, чтобы пользоваться полученной формулой для параметра $\alpha$ $$\alpha=\frac{\sqrt{2}\pi}{2}erf^{-1}(\gamma),$$ надо доказать, что $r^*=|\frac{r}{\sigma}|\sim N_h(\frac{\pi}{2})$, где $R=\{r_{i}\}_{i=1}^N$ --- остатки, $\sigma=(\sigma_1,\ldots,\sigma_N)$ --- тренд из $|R|$. 
+
+ 
+Если сигнал $n e^{an} \sin(2\pi\omega n)$ отделим от шума, то остатки $R=Ae^{an}\varepsilon_n$.
+
+Известно, что если $\varepsilon \sim N(0,\sigma_\varepsilon^2),$ то $\mathbb{E}|\varepsilon| = \sigma_\varepsilon \sqrt{\frac{2}{\pi}}$, $\mathbb{D}|\varepsilon| = \sigma_\varepsilon^2 (1-\frac{2}{\pi}).$
+
+$$\mathbb{E}|R| = Ae^{an} \mathbb{E} |\varepsilon| = Ae^{an}\sqrt{\frac{2}{\pi}}.$$ Выпишем нормированные остатки: $\frac{r}{\sigma} = \frac{Ae^{an}\varepsilon}{Ae^{an}\mathbb{E}|\varepsilon|} \sim N(0,\frac{1}{\frac{2}{\pi}}) = N(0,\frac{\pi}{2}).$
+
+ Тогда получим следующее: $|\frac{r}{\sigma}| \sim  N_h(\frac{\pi}{2})$ по определению полунормального распределения.
+ 
+
+$$|r^*|=|\frac{Ae^{an}\varepsilon}{\sigma}|=\frac{Ae^{an}|\varepsilon|}{Ae^{an}\mathbb{E}|\varepsilon|} = \frac{|\varepsilon|}{\sqrt{\frac{2}{\pi}}}.$$ Тогда (аналогично шуму с постоянной дисперсией) посчитаем среднее и дисперсию: $$\mathbb{E}{r^*} = \frac{\mathbb{E}|\varepsilon|}{\sqrt{\frac{2}{\pi}}} = 1,$$ $$\mathbb{D}{r^*} = \frac{\mathbb{D}|\varepsilon|}{\frac{2}{\pi}} = \frac{(1-\frac{2}{\pi})}{\frac{2}{\pi}} = \frac{\pi}{2}-1.$$ Тогда если мы поделим модуль из остатков на тренд, то сможем при $\gamma=0.95$ взять $\alpha=4.046$.
+
+График ряда без выбросов:
+
+```{r}
+N<-240
+sig <- (1:N)*exp(4*(1:N)/N)*sin(2*pi*(1:N)/30)
+
+sig.outl<-sig
+outlier.seq<-sample(1:(N),N*0.05)
+sig.outl[outlier.seq]<-sig.outl[outlier.seq]+0*sig.outl[outlier.seq]
+ser<-sig.outl+30*exp(4*(1:N)/N)*rnorm(N)
+real.trend<-30*exp(4*(1:N)/N)
+plot(ser,type='l')
+```
+
+График ряда с 5% выбросов:
+
+```{r}
+sig.outl<-sig
+outlier.seq<-sample(1:(N),N*0.05)
+sig.outl[outlier.seq]<-sig.outl[outlier.seq]+1.5*sig.outl[outlier.seq]
+ser<-sig.outl+30*exp(4*(1:N)/N)*rnorm(N)
+
+plot(ser,type='l')
+X<-hankel(ser, L=120)
+
+eps<-1e-8
+eps1<-1e-5
+maxITER<-20
+maxiter<-10
+```
+
+Проблемы могут быть две --- либо плохо выделится тренд из ряда модулей остатков, либо отсутствие разделимости между сигналом и шумом. 
+
+Попробуем два варианта --- выделять тренд скользящей медианой, методом loess, и для сравнения добавим истинный тренд остатков. 
+
+График модуля из остатков и выделение тренда разными способами (в случае 5% выбросов):
+
+```{r}
+  M<-X
+  m<-nrow(M)
+  n<-ncol(M)
+  initial<-svd(M)
+  k<-2
+  U<-initial$u[1:nrow(initial$u),1:k]
+  Lambda<-initial$d[1:k]
+  V<-initial$v[1:nrow(initial$v),1:k]
+  U<-U%*%diag(Lambda)
+  alpha<-4.046
+  ITER<-0
+  iter<-0
+
+
+    R<-M-U%*%t(V)
+    r<-as.vector(t(R))
+    RR<-hankL1(R)
+    loessMod30 <- loess(abs(RR) ~ c(1:length(abs(RR))), span=0.30)
+    sigma <- predict(loessMod30)
+
+    sigma1<-runmed(abs(RR),61)
+    sigma1[(N-30):N]<-calc.ends(abs(RR),30)
+
+    sigma2<-real.trend*sqrt(2/pi)
+    plot((abs(RR)), type='l')
+    lines(sigma, type='l',col='blue',lw=2)
+    lines(sigma1, type='l',col='red',lw=2)
+    lines(sigma2, type='l',col='green',lw=2)
+    legend('topleft', c("loess", "median", "real trend"),
+       col=c("blue","red","green"), lty=1, cex=0.8, lw=2)
+    
+    RR.trmatrix<-hankel(RR,L=120)
+    sigma.trmatrix<-hankel(sigma,L=120)
+    sigma.trmatrix1<-hankel(sigma1,L=120)
+    sigma.trmatrix2<-hankel(sigma2,L=120)
+    ```
+    
+    Нормированные на тренд остатки (их модуль), красной линией --- заданный нами уровень $\alpha$:
+    
+```{r}
+    plot(hankL1(abs(RR.trmatrix)/sigma.trmatrix), type='l')
+    lines(rep(alpha,N),col='red')
+    title(main='|R|/sigma: loess')
+    plot(hankL1(abs(RR.trmatrix)/sigma.trmatrix1), type='l')
+    lines(rep(alpha,N),col='red')
+    title(main='|R|/sigma: median')
+    plot(hankL1(abs(RR.trmatrix)/sigma.trmatrix2), type='l')
+    lines(rep(alpha,N),col='red')
+    title(main='|R|/sigma: real trend')
+```
+
+Полученные веса:
+
+```{r}
+    
+    W<-weights(RR.trmatrix,sigma.trmatrix,alpha,m,n)
+    WW<-hankL1(W)
+    Weights<-WW
+    plot(Weights, type='l')
+    title(main='Weights loess')
+    
+     W<-weights(RR.trmatrix,sigma.trmatrix1,alpha,m,n)
+    WW<-hankL1(W)
+    Weights<-WW
+    plot(Weights, type='l')
+    title(main='Weights median')
+    
+     W<-weights(RR.trmatrix,sigma.trmatrix2,alpha,m,n)
+    WW<-hankL1(W)
+    Weights<-WW
+    plot(Weights, type='l')
+    title(main='Weights real trend')
+    
+    
+```
+
+
+```{r,include=FALSE}
+QR_WLS<-function(X,k,trend.ver='loess'){
+  M<-X
+  m<-nrow(M)
+  n<-ncol(M)
+  initial<-svd(M)
+  U<-initial$u[1:nrow(initial$u),1:k]
+  Lambda<-initial$d[1:k]
+  V<-initial$v[1:nrow(initial$v),1:k]
+  U<-U%*%diag(Lambda)
+  alpha<-4.046
+  eps<-1e-8
+  eps1<-1e-5
+  maxITER<-20
+  maxiter<-10
+  ITER<-0
+  iter<-0
+  
+  
+  repeat {
+    R<-M-U%*%t(V)
+    r<-as.vector(t(R))
+    RR<-hankL1(R)
+    loessMod30 <- loess(abs(RR) ~ c(1:length(abs(RR))), span=0.30)
+    sigma <- predict(loessMod30)
+    
+    sigma1<-runmed(abs(RR),61)
+    sigma1[(N-30):N]<-calc.ends(abs(RR),30)
+    
+    sigma2<-real.trend*sqrt(2/pi)
+    
+    RR.trmatrix<-hankel(RR,L=120)
+    if (trend.ver == 'loess') {sigma.trmatrix<-hankel(sigma,L=120)}
+    else if (trend.ver == 'median') {sigma.trmatrix<-hankel(sigma1,L=120)}
+    else if (trend.ver == 'real') {sigma.trmatrix<-hankel(sigma2,L=120)}
+    #RR.row<-as.vector(RR.trmatrix)
+    #sigma.trmatrix<-hankel(sigma,L=120)
+    
+    #plot(hankL1(abs(RR.trmatrix)/sigma.trmatrix), type='l')
+    
+    
+    #plot(hankL1(log(abs(RR.trmatrix))), type='l')
+    W<-weights(RR.trmatrix,sigma.trmatrix,alpha,m,n)
+   
+    WW<-hankL1(W)
+   # plot(WW, type='l')
+    Weights<-WW
+    #plot(Weights, type='l')
+    #title(main='Weights')
+    
+    repeat{
+      for (i in (1:m)){
+        Wi<-diag(W[i,1:ncol(W)])
+        mi<-M[i,1:ncol(M)]
+        QR <- qr(t(V)%*%Wi%*%V)
+        Q <- qr.Q( QR )
+        R <- qr.R( QR )
+        beta<-backsolve(R,t(Q)%*%t(V)%*%Wi%*%mi)
+        U[i,1:ncol(U)]<-beta
+      }
+      U<-U[1:nrow(U),1:k]
+      
+      for (j in (1:n)){
+        Wj<-diag(W[1:nrow(W),j])
+        mj<-M[1:nrow(M),j]
+        QR <- qr(t(U)%*%Wj%*%U)
+        Q <- qr.Q( QR )
+        R <- qr.R( QR )
+        beta<-backsolve(R,t(Q)%*%t(U)%*%Wj%*%mj)
+        V[j,1:ncol(V)]<-beta
+      }
+      V<-V[1:nrow(V),1:k]
+      
+      iter<-iter+1
+      if ( ((frobenius.norm(W^{1/2}*(M-U%*%t(V))))^2<eps) | (iter > maxiter) ) {break}
+    }
+    
+    ITER<-ITER+1
+    if ( ((frobenius.norm(W^{1/2}*(M-U%*%t(V))))^2<eps) | (ITER > maxITER) ) { break}
+    iter<-0
+  }
+  M_est<-U%*%t(V)
+  return(M_est)
+}
+
+```
+
+
+```{r}
+sig <- (1:N)*exp(4*(1:N)/N)*sin(2*pi*(1:N)/30)
+ser<-sig+30*exp(4*(1:N)/N)*rnorm(N)
+
+ s <- ssa(ser, L = 120)
+ plot(s, type = "vectors",idx = 1:10)
+ plot(wcor(s))
+ rec <- reconstruct(s, groups = list(c(1:2))) 
+ plot(rec, add.residuals = TRUE, add.original = TRUE,
+     plot.method = "xyplot", superpose = TRUE, auto.key = list(columns = 2))
+```
+
+Для начала попробуем без выбросов.
+
+```{r}
+set.seed(7)
+M <- 1
+
+MSE.SSA <- rep(0,M)
+MSE.L1svd <- rep(0,M)
+MSE <- rep(0,M)
+MSE1 <- rep(0,M)
+MSE2 <- rep(0,M)
+
+MAD.SSA <- rep(0,M)
+MAD.L1svd <- rep(0,M)
+MAD <- rep(0,M)
+MAD1 <- rep(0,M)
+MAD2 <- rep(0,M)
+
+
+for(k in 1:M)
+{
+
+  # Without outliers
+
+sig <- (1:N)*exp(4*(1:N)/N)*sin(2*pi*(1:N)/30)
+
+sig.outl<-sig
+outlier.seq<-sample(1:(N),N*0.05)
+sig.outl[outlier.seq]<-sig.outl[outlier.seq]+0*sig.outl[outlier.seq]
+ser<-sig.outl+30*exp(4*(1:N)/N)*rnorm(N)
+
+#plot(ser,type='l')
+X<-hankel(ser, L=120)
+
+  ############################### #SSA120.3 ##############################
+
+  s <- ssa(ser, L = 120)
+  rec <- reconstruct(s, groups = list(c(1:2)))
+
+  # plot(s, type = "vectors",idx = 1:10)
+  # plot(rec, add.residuals = TRUE, add.original = TRUE,
+  #  plot.method = "xyplot", superpose = TRUE, auto.key = list(columns = 2))
+  #plot(wcor(s))
+  trend.season <- rec$F1
+
+  ############################# #pcaL1(120.3)###############################
+  X<-hankel(ser,L=120)
+  s.L1svd<-l1pca(X,center=FALSE,projections="l1",projDim=2)
+
+  Pr<-s.L1svd$projPoints
+  Pr.L1svd<-hankL1(Pr)
+
+  ###################### WLS ########################
+  Pr<-QR_WLS(X,2,'loess')
+  Pr0<-hankL1(Pr)
+
+  Pr<-QR_WLS(X,2,'median')
+  Pr1<-hankL1(Pr)
+
+  Pr<-QR_WLS(X,2,'real')
+  Pr2<-hankL1(Pr)
+
+
+  #MSE
+  MSE.SSA[k] <- mean((sig - trend.season)[1:N]^2)
+  MSE.L1svd[k] <- mean((sig - Pr.L1svd)[1:N]^2)
+  MSE[k] <- mean((sig - Pr0)[1:N]^2)
+  MSE1[k] <- mean((sig - Pr1)[1:N]^2)
+  MSE2[k] <- mean((sig - Pr2)[1:N]^2)
+
+  #MAD
+  MAD.SSA[k] <- mean(abs((sig - trend.season)[1:N]))
+  MAD.L1svd[k] <- mean(abs((sig - Pr.L1svd)[1:N]))
+  MAD[k] <- mean(abs((sig - Pr0)[1:N]))
+  MAD1[k] <- mean(abs((sig - Pr1)[1:N]))
+  MAD2[k] <- mean(abs((sig - Pr2)[1:N]))
+
+}
+
+RMSE.SSA<-sqrt(mean(MSE.SSA))
+RMSE.L1svd<-sqrt(mean(MSE.L1svd))
+RMSE<-sqrt(mean(MSE))
+RMSE1<-sqrt(mean(MSE1))
+RMSE2<-sqrt(mean(MSE2))
+
+MAD.SSA<-mean(MAD.SSA)
+MAD.L1svd<-mean(MAD.L1svd)
+MAD<-mean(MAD)
+MAD1<-mean(MAD1)
+MAD2<-mean(MAD2)
+
+RMSE.SSA #ошибка SSA
+RMSE.L1svd #ошибка последовательного метода L1svd
+RMSE #ошибка IRLS с выделением тренда из модуля остатков с помощью loess
+RMSE1 #ошибка IRLS с выделением тренда из модуля остатков с помощью скользящей медианы
+RMSE2 #ошибка IRLS со знанием реального тренда из модуля остатков
+
+```
+
+Посмотрим на восстановление сигнала всеми методами.
+
+```{r}
+plot(sig,type='l')
+lines(ser,col='gray')
+lines(trend.season,type='l',col='blue',lw=2)
+lines(Pr.L1svd,type='l',col='red',lw=2)
+lines(Pr0,type='l',col='violet',lw=2)
+lines( Pr1,type='l',col='green',lw=2)
+lines( Pr2,type='l',col='orange',lw=2)
+legend('topleft', c("SSA","L1svd","IRLS.loess", "IRLS.median", "IRLS.real trend"),
+       col=c("blue","red","violet","green","orange"), lty=1, cex=0.8, lw=2)
+```
+
+Конец ряда поближе:
+
+```{r}
+plot(sig[150:N],type='l')
+lines(ser[150:N],col='gray')
+lines(trend.season[150:N],type='l',col='blue',lw=2)
+lines(Pr.L1svd[150:N],type='l',col='red',lw=2)
+lines(Pr0[150:N],type='l',col='violet',lw=2)
+lines( Pr1[150:N],type='l',col='green',lw=2)
+lines( Pr2[150:N],type='l',col='orange',lw=2)
+legend('topleft', c("SSA","L1svd","IRLS.loess", "IRLS.median", "IRLS.real trend"),
+       col=c("blue","red","violet","green","orange"), lty=1, cex=0.8, lw=2)
+```
+
+Стоит заметить, что ошибка даже без выбросов достаточно велика, и ошибки методов IRLS с разными вариантами выделения тренда не сильно отличаются друг от друга. Предполагаем, что проблема все же в разделимости.
+
+С 5% выбросов:
+
+```{r}
+set.seed(7)
+M <- 1
+
+MSE.SSA <- rep(0,M)
+MSE.L1svd <- rep(0,M)
+MSE <- rep(0,M)
+MSE1 <- rep(0,M)
+MSE2 <- rep(0,M)
+
+MAD.SSA <- rep(0,M)
+MAD.L1svd <- rep(0,M)
+MAD <- rep(0,M)
+MAD1 <- rep(0,M)
+MAD2 <- rep(0,M)
+
+
+for(k in 1:M)
+{
+
+
+sig <- (1:N)*exp(4*(1:N)/N)*sin(2*pi*(1:N)/30)
+
+sig.outl<-sig
+outlier.seq<-sample(1:(N),N*0.05)
+sig.outl[outlier.seq]<-sig.outl[outlier.seq]+1.5*sig.outl[outlier.seq]
+ser<-sig.outl+30*exp(4*(1:N)/N)*rnorm(N)
+
+#plot(ser,type='l')
+X<-hankel(ser, L=120)
+
+  ############################### #SSA120.3 ##############################
+
+  s <- ssa(ser, L = 120)
+  rec <- reconstruct(s, groups = list(c(1:2)))
+
+  # plot(s, type = "vectors",idx = 1:10)
+  # plot(rec, add.residuals = TRUE, add.original = TRUE,
+  #  plot.method = "xyplot", superpose = TRUE, auto.key = list(columns = 2))
+  #plot(wcor(s))
+  trend.season <- rec$F1
+
+  ############################# #pcaL1(120.3)###############################
+  X<-hankel(ser,L=120)
+  s.L1svd<-l1pca(X,center=FALSE,projections="l1",projDim=2)
+
+  Pr<-s.L1svd$projPoints
+  Pr.L1svd<-hankL1(Pr)
+
+  ###################### WLS ########################
+  Pr<-QR_WLS(X,2,'loess')
+  Pr0<-hankL1(Pr)
+
+  Pr<-QR_WLS(X,2,'median')
+  Pr1<-hankL1(Pr)
+
+  Pr<-QR_WLS(X,2,'real')
+  Pr2<-hankL1(Pr)
+
+
+  #MSE
+  MSE.SSA[k] <- mean((sig - trend.season)[1:N]^2)
+  MSE.L1svd[k] <- mean((sig - Pr.L1svd)[1:N]^2)
+  MSE[k] <- mean((sig - Pr0)[1:N]^2)
+  MSE1[k] <- mean((sig - Pr1)[1:N]^2)
+  MSE2[k] <- mean((sig - Pr2)[1:N]^2)
+
+  #MAD
+  MAD.SSA[k] <- mean(abs((sig - trend.season)[1:N]))
+  MAD.L1svd[k] <- mean(abs((sig - Pr.L1svd)[1:N]))
+  MAD[k] <- mean(abs((sig - Pr0)[1:N]))
+  MAD1[k] <- mean(abs((sig - Pr1)[1:N]))
+  MAD2[k] <- mean(abs((sig - Pr2)[1:N]))
+
+}
+
+RMSE.SSA<-sqrt(mean(MSE.SSA))
+RMSE.L1svd<-sqrt(mean(MSE.L1svd))
+RMSE<-sqrt(mean(MSE))
+RMSE1<-sqrt(mean(MSE1))
+RMSE2<-sqrt(mean(MSE2))
+
+MAD.SSA<-mean(MAD.SSA)
+MAD.L1svd<-mean(MAD.L1svd)
+MAD<-mean(MAD)
+MAD1<-mean(MAD1)
+MAD2<-mean(MAD2)
+
+RMSE.SSA #ошибка SSA
+RMSE.L1svd #ошибка последовательного метода L1svd
+RMSE #ошибка IRLS с выделением тренда из модуля остатков с помощью loess
+RMSE1 #ошибка IRLS с выделением тренда из модуля остатков с помощью скользящей медианы
+RMSE2 #ошибка IRLS со знанием реального тренда из модуля остатков
+
+
+
+plot(sig,type='l')
+lines(ser,col='gray')
+lines(trend.season,type='l',col='blue',lw=2)
+lines(Pr.L1svd,type='l',col='red',lw=2)
+lines(Pr0,type='l',col='violet',lw=2)
+lines( Pr1,type='l',col='green',lw=2)
+lines( Pr2,type='l',col='orange',lw=2)
+legend('topleft', c("SSA","L1svd","IRLS.loess", "IRLS.median", "IRLS.real trend"),
+       col=c("blue","red","violet","green","orange"), lty=1, cex=0.8, lw=2)
+
+plot(sig[150:N],type='l')
+lines(ser[150:N],col='gray')
+lines(trend.season[150:N],type='l',col='blue',lw=2)
+lines(Pr.L1svd[150:N],type='l',col='red',lw=2)
+lines(Pr0[150:N],type='l',col='violet',lw=2)
+lines( Pr1[150:N],type='l',col='green',lw=2)
+lines( Pr2[150:N],type='l',col='orange',lw=2)
+legend('topleft', c("SSA","L1svd","IRLS.loess", "IRLS.median", "IRLS.real trend"),
+       col=c("blue","red","violet","green","orange"), lty=1, cex=0.8, lw=2)
+```
+
+
+Видим, что L1svd и IRLS, использующий локальную регрессию для выделения тренда, оказываются наилучшими. Ошибка хоть и намного меньше ошибки стандартного SSA, но все еще достаточно большая. Ошибка метода IRLS со знанием истинного тренда оказалась также большой. Вероятно, проблема тогда не в выделении тренда, а в самой разделимости. 
